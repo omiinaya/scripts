@@ -5,11 +5,15 @@
 
 LOG_FILE="/var/log/change_ct_id.log"
 VERBOSE=0
+KEEP_ORIGINAL=0
 
-# Parse --verbose flag
+# Parse --verbose and --keep-original flags
 for arg in "$@"; do
     if [ "$arg" = "--verbose" ]; then
         VERBOSE=1
+        shift
+    elif [ "$arg" = "--keep-original" ]; then
+        KEEP_ORIGINAL=1
         shift
     fi
 done
@@ -135,17 +139,63 @@ log "Detected storage: $STORAGE"
 check_disk_space() {
     local storage="$1"
     local required="$2"
-    local storage_path=$(pvesm status | grep "^$storage" | awk '{print $7}')
-    if [ -z "$storage_path" ]; then
-        log "Error: Could not determine path for storage '$storage'."
-        exit 2
+    local storage_info=$(pvesm status | grep "^$storage ")
+    local storage_type=$(echo "$storage_info" | awk '{print $2}')
+    local storage_path=$(echo "$storage_info" | awk '{print $7}')
+
+    if [ "$storage_type" = "dir" ] || [ "$storage_type" = "nfs" ] || [ "$storage_type" = "cifs" ]; then
+        # Directory, NFS, or CIFS storage: use the path for df
+        if [ -z "$storage_path" ] || [ ! -d "$storage_path" ]; then
+            log "Warning: Could not determine a valid path for storage '$storage'. Skipping disk space check."
+            return
+        fi
+        local available=$(df --block-size=1 --output=avail "$storage_path" | tail -n 1)
+        if [ -z "$available" ] || ! [[ "$available" =~ ^[0-9]+$ ]]; then
+            log "Warning: Could not determine available disk space for $storage_path. Skipping disk space check."
+            return
+        fi
+        if [ "$available" -lt "$required" ]; then
+            log "Error: Insufficient disk space on $storage_path. Required: $((required / 1024 / 1024)) MB, Available: $((available / 1024 / 1024)) MB"
+            exit 2
+        fi
+        log "Sufficient disk space on $storage_path: $((available / 1024 / 1024)) MB available"
+    elif [ "$storage_type" = "lvm" ] || [ "$storage_type" = "lvmthin" ]; then
+        # LVM or LVM-Thin: use vgs for free space
+        local vg=$(echo "$storage_info" | awk '{print $6}')
+        if [ -z "$vg" ]; then
+            log "Warning: Could not determine volume group for LVM storage '$storage'. Skipping disk space check."
+            return
+        fi
+        local available=$(vgs --noheadings -o vg_free --units b "$vg" | awk '{print $1}' | tr -d 'B')
+        if [ -z "$available" ] || ! [[ "$available" =~ ^[0-9]+$ ]]; then
+            log "Warning: Could not determine available LVM space for $vg. Skipping disk space check."
+            return
+        fi
+        if [ "$available" -lt "$required" ]; then
+            log "Error: Insufficient LVM space in $vg. Required: $((required / 1024 / 1024)) MB, Available: $((available / 1024 / 1024)) MB"
+            exit 2
+        fi
+        log "Sufficient LVM space in $vg: $((available / 1024 / 1024)) MB available"
+    elif [ "$storage_type" = "zfspool" ]; then
+        # ZFS: use zfs list for available space
+        local pool=$(echo "$storage_info" | awk '{print $6}')
+        if [ -z "$pool" ]; then
+            log "Warning: Could not determine ZFS pool for storage '$storage'. Skipping disk space check."
+            return
+        fi
+        local available=$(zfs get -Hp -o value available "$pool")
+        if [ -z "$available" ] || ! [[ "$available" =~ ^[0-9]+$ ]]; then
+            log "Warning: Could not determine available ZFS space for $pool. Skipping disk space check."
+            return
+        fi
+        if [ "$available" -lt "$required" ]; then
+            log "Error: Insufficient ZFS space in $pool. Required: $((required / 1024 / 1024)) MB, Available: $((available / 1024 / 1024)) MB"
+            exit 2
+        fi
+        log "Sufficient ZFS space in $pool: $((available / 1024 / 1024)) MB available"
+    else
+        log "Warning: Storage type '$storage_type' not supported for disk space check. Skipping check."
     fi
-    local available=$(df --block-size=1 --output=avail "$storage_path" | tail -n 1)
-    if [ "$available" -lt "$required" ]; then
-        log "Error: Insufficient disk space on $storage_path. Required: $((required / 1024 / 1024)) MB, Available: $((available / 1024 / 1024)) MB"
-        exit 2
-    fi
-    log "Sufficient disk space on $storage_path: $((available / 1024 / 1024)) MB available"
 }
 
 # Estimate guest size
@@ -262,12 +312,16 @@ if [ "$GUEST_TYPE" = "ct" ]; then
         log "Check logs with 'journalctl -u pve*'."
         exit 2
     fi
-    log "Deleting original container $CURRENT_ID..."
-    pct destroy "$CURRENT_ID" || {
-        log "Warning: Failed to delete original container $CURRENT_ID. New container $NEW_ID is running."
-        exit 2
-    }
-    log "Deleted CT $CURRENT_ID"
+    if [ "$KEEP_ORIGINAL" -eq 0 ]; then
+        log "Deleting original container $CURRENT_ID..."
+        pct destroy "$CURRENT_ID" || {
+            log "Warning: Failed to delete original container $CURRENT_ID. New container $NEW_ID is running."
+            exit 2
+        }
+        log "Deleted CT $CURRENT_ID"
+    else
+        log "--keep-original flag set. Skipping deletion of original container $CURRENT_ID."
+    fi
 elif [ "$GUEST_TYPE" = "vm" ]; then
     qmrestore --storage "$STORAGE" "$BACKUP_FILE" "$NEW_ID" || {
         log "Error: Failed to restore VM as $NEW_ID. Old VM $CURRENT_ID preserved."
@@ -287,12 +341,16 @@ elif [ "$GUEST_TYPE" = "vm" ]; then
         log "Check logs with 'journalctl -u pve*'."
         exit 2
     fi
-    log "Deleting original VM $CURRENT_ID..."
-    qm destroy "$CURRENT_ID" || {
-        log "Warning: Failed to delete original VM $CURRENT_ID. New VM $NEW_ID is running."
-        exit 2
-    }
-    log "Deleted VM $CURRENT_ID"
+    if [ "$KEEP_ORIGINAL" -eq 0 ]; then
+        log "Deleting original VM $CURRENT_ID..."
+        qm destroy "$CURRENT_ID" || {
+            log "Warning: Failed to delete original VM $CURRENT_ID. New VM $NEW_ID is running."
+            exit 2
+        }
+        log "Deleted VM $CURRENT_ID"
+    else
+        log "--keep-original flag set. Skipping deletion of original VM $CURRENT_ID."
+    fi
 fi
 
 exit 0
